@@ -95,6 +95,13 @@ class SquaizerSidecarTests(unittest.TestCase):
         self.assertIn("just this file", payload["text"])
         self.assertIn("no", payload["text"])
 
+    def test_mid_sentence_politeness_keeps_separator(self):
+        original = "npm:@agnishc/edb-auto-name-session doesnt seem to work, please check why whitespace is missing"
+        payload = self.compress(original)
+        self.assertEqual(payload["status"], "compressed")
+        self.assertIn("work, check", payload["text"])
+        self.assertNotIn("workcheck", payload["text"])
+
     def test_cli_reads_stdin_and_emits_json(self):
         proc = subprocess.run(
             [sys.executable, str(PYTHON_DIR / "squaizer_sidecar.py"), "--mode", "regex", "--min-savings", "0"],

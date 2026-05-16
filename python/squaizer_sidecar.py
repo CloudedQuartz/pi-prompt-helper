@@ -261,13 +261,7 @@ def extend_delete_span(text: str, start: int, end: int) -> tuple[int, int]:
         # and "can you please help" -> "can you help" without rewriting text.
         new_end += 1
 
-    before = text[:new_start]
-    trimmed_before = before.rstrip()
-    if trimmed_before.endswith((",", ";", ":")):
-        comma_index = len(trimmed_before) - 1
-        if all(ch.isspace() for ch in text[comma_index + 1 : new_start]):
-            new_start = comma_index
-    elif new_start > 0 and text[new_start - 1].isspace() and (new_end >= len(text) or text[new_end - 1].isspace()):
+    if new_start > 0 and text[new_start - 1].isspace() and (new_end >= len(text) or text[new_end - 1].isspace()):
         # For trailing terms, remove one preceding space rather than leaving a gap.
         if new_end >= len(text):
             new_start -= 1
