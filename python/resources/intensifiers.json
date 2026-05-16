@@ -1,0 +1,33 @@
+{
+  "metadata": {
+    "kind": "candidate",
+    "name": "Intensifiers and boosters",
+    "description": "Candidate-only degree modifiers and boosters from intensifier literature; deletion is gated to avoid protected/code/constraint spans.",
+    "sources": [
+      {
+        "name": "Quirk et al. (1985), A Comprehensive Grammar of the English Language",
+        "url": "https://www.worldcat.org/isbn/0582517346"
+      },
+      {
+        "name": "Paradis, C. (1997), Degree Modifiers of Adjectives in Spoken British English",
+        "url": "https://portal.research.lu.se/en/publications/degree-modifiers-of-adjectives-in-spoken-british-english"
+      }
+    ]
+  },
+  "categories": {
+    "degree_modifiers": [
+      { "term": "very", "fallback": true },
+      { "term": "really", "fallback": true },
+      { "term": "quite", "fallback": true },
+      { "term": "rather", "fallback": true },
+      { "term": "extremely", "fallback": true },
+      { "term": "super", "fallback": true }
+    ],
+    "boosters": [
+      { "term": "absolutely", "fallback": true },
+      { "term": "totally", "fallback": true },
+      { "term": "definitely", "fallback": false },
+      { "term": "just", "fallback": true, "sentence_initial": true }
+    ]
+  }
+}

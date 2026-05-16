@@ -1,0 +1,31 @@
+{
+  "metadata": {
+    "kind": "candidate",
+    "name": "Discourse markers",
+    "description": "Candidate-only list of discourse connectives and interaction markers; many are only deleted at sentence start to avoid harming logical relations.",
+    "sources": [
+      {
+        "name": "Fraser, B. (1999), What are discourse markers?",
+        "url": "https://doi.org/10.1016/S0378-2166(98)00101-5"
+      },
+      {
+        "name": "Penn Discourse Treebank project",
+        "url": "https://catalog.ldc.upenn.edu/LDC2008T05"
+      }
+    ]
+  },
+  "categories": {
+    "sentence_initial_markers": [
+      { "term": "so", "fallback": true, "sentence_initial": true },
+      { "term": "well", "fallback": true, "sentence_initial": true },
+      { "term": "okay", "fallback": true, "sentence_initial": true },
+      { "term": "ok", "fallback": true, "sentence_initial": true },
+      { "term": "alright", "fallback": true, "sentence_initial": true }
+    ],
+    "weak_transitions": [
+      { "term": "anyway", "fallback": true, "sentence_initial": true },
+      { "term": "by the way", "fallback": true, "sentence_initial": true },
+      { "term": "for what it's worth", "fallback": true, "sentence_initial": true }
+    ]
+  }
+}

@@ -1,0 +1,31 @@
+{
+  "name": "pi-prompt-helper",
+  "version": "0.1.0",
+  "description": "Local deletion-only prompt compression extension for pi.",
+  "type": "module",
+  "pi": {
+    "extensions": [
+      "./src/index.ts"
+    ]
+  },
+  "scripts": {
+    "check": "tsc --noEmit && node scripts/smoke-extension.mjs",
+    "test": "python3 -m unittest discover -s tests && npm run test:extension",
+    "test:extension": "rm -rf .tmp-test && tsc -p tsconfig.test.json && node --test tests/extension.test.mjs; status=$?; rm -rf .tmp-test; exit $status"
+  },
+  "keywords": [
+    "pi",
+    "prompt-compression",
+    "spacy"
+  ],
+  "author": "",
+  "license": "ISC",
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "^0.74.0",
+    "@types/node": "^25.8.0",
+    "typescript": "^6.0.3"
+  }
+}
