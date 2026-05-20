@@ -1,265 +1,292 @@
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { spawn } from "node:child_process";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
-type SidecarResult = {
-	status?: string;
+type InputEvent = {
+	text: string;
+	source?: string;
+	images?: unknown[];
+};
+
+type InputResult =
+	| { action: "continue" }
+	| { action: "transform"; text: string; images?: unknown[] }
+	| { action: "handled" };
+
+type CommandContext = {
+	hasUI?: boolean;
+	ui?: {
+		notify?: (message: string, level?: "info" | "warning" | "error") => void;
+	};
+};
+
+type ExtensionAPI = {
+	on(
+		event: "input",
+		handler: (
+			event: InputEvent,
+			ctx?: CommandContext,
+		) => Promise<InputResult> | InputResult,
+	): void;
+	registerCommand(
+		name: string,
+		command: {
+			description: string;
+			handler: (args: string, ctx: CommandContext) => Promise<void> | void;
+		},
+	): void;
+	sendUserMessage(text: string): void;
+};
+
+type CleanerPayload = {
+	ok?: boolean;
+	status?: "cleaned" | "original" | "error";
 	text?: string;
-	original_chars?: number;
-	compressed_chars?: number;
-	savings_ratio?: number;
 	reason?: string;
 	mode?: string;
-	deleted?: Array<{ text?: string; category?: string }>;
+	original_chars?: number;
+	cleaned_chars?: number;
+	savings_ratio?: number;
+	deleted?: Array<{ text: string; reason: string }>;
 };
 
-type Stats = {
-	seen: number;
-	compressed: number;
-	skipped: number;
-	errors: number;
-	charsSaved: number;
-	last?: SidecarResult & { at: string };
-};
+type State =
+	| { kind: "idle" }
+	| { kind: "loading"; startedAt: string }
+	| { kind: "ready"; mode: string; checkedAt: string }
+	| { kind: "failed"; reason: string; checkedAt: string };
 
-const EXTENSION_DIR = dirname(fileURLToPath(import.meta.url));
-const DEFAULT_SIDECAR = resolve(EXTENSION_DIR, "../python/squaizer_sidecar.py");
+const extensionDir = dirname(fileURLToPath(import.meta.url));
+const defaultCleanerPath = resolve(extensionDir, "../python/prompt_cleaner.py");
+const falseValues = new Set(["0", "false", "no", "off", "disabled"]);
 
-function envFlag(name: string, defaultValue: boolean): boolean {
-	const raw = process.env[name];
-	if (raw === undefined || raw === "") return defaultValue;
-	return !["0", "false", "no", "off", "disabled"].includes(raw.toLowerCase());
+function envFlag(name: string, fallback: boolean): boolean {
+	const value = process.env[name];
+	return value === undefined || value === ""
+		? fallback
+		: !falseValues.has(value.toLowerCase());
 }
 
-function envNumber(name: string, defaultValue: number): number {
-	const raw = process.env[name];
-	if (!raw) return defaultValue;
-	const parsed = Number(raw);
-	return Number.isFinite(parsed) ? parsed : defaultValue;
+function envNumber(name: string, fallback: number): number {
+	const value = process.env[name];
+	if (!value) return fallback;
+	const parsed = Number(value);
+	return Number.isFinite(parsed) ? parsed : fallback;
 }
 
-type NotifyLevel = "info" | "warning" | "error";
+function settings() {
+	return {
+		python:
+			process.env.PI_PROMPT_HELPER_PYTHON || process.env.PYTHON || "python3",
+		cleaner: process.env.PI_PROMPT_HELPER_CLEANER || defaultCleanerPath,
+		minSavings: envNumber("PI_PROMPT_HELPER_MIN_SAVINGS", 0.03),
+		timeoutMs: envNumber("PI_PROMPT_HELPER_TIMEOUT_MS", 2000),
+	};
+}
 
 function notify(
-	ctx: {
-		hasUI?: boolean;
-		ui?: { notify?: (message: string, level?: NotifyLevel) => void };
-	},
+	ctx: CommandContext | undefined,
 	message: string,
-	level: NotifyLevel = "info",
+	level: "info" | "warning" | "error" = "info",
 ) {
-	if (ctx.hasUI && ctx.ui?.notify) {
-		ctx.ui.notify(message, level);
-	}
+	ctx?.ui?.notify?.(message, level);
 }
 
-function shouldSkipInput(
-	event: { text: string; images?: unknown[]; source?: string },
-	enabled: boolean,
-): string | undefined {
-	if (!enabled) return "disabled";
-	if (event.source === "extension") return "extension-source";
-	if (!event.text.trim()) return "blank";
+function shouldSkip(event: InputEvent, enabled: boolean): boolean {
+	if (!enabled) return true;
+	if (event.source === "extension") return true;
+	if (!event.text.trim()) return true;
 	if (
-		!envFlag("PI_PROMPT_HELPER_COMPRESS_SLASH", false) &&
+		!envFlag("PI_PROMPT_HELPER_CLEAN_SLASH", false) &&
 		event.text.trimStart().startsWith("/")
-	) {
-		return "slash-command";
-	}
+	)
+		return true;
 	if (
-		!envFlag("PI_PROMPT_HELPER_COMPRESS_IMAGES", false) &&
+		!envFlag("PI_PROMPT_HELPER_CLEAN_IMAGES", false) &&
 		event.images &&
 		event.images.length > 0
-	) {
-		return "attached-images";
-	}
-	return undefined;
+	)
+		return true;
+	return false;
 }
 
-function runSidecar(
-	text: string,
-	minSavings: number,
-	mode: string,
-	timeoutMs: number,
-): Promise<SidecarResult> {
-	const python =
-		process.env.PI_PROMPT_HELPER_PYTHON || process.env.PYTHON || "python3";
-	const sidecar = process.env.PI_PROMPT_HELPER_SIDECAR || DEFAULT_SIDECAR;
-	const args = [sidecar, "--min-savings", String(minSavings), "--mode", mode];
-
+function runCleaner(args: string[], stdin: string): Promise<CleanerPayload> {
+	const { python, cleaner, timeoutMs } = settings();
 	return new Promise((resolvePromise, rejectPromise) => {
-		const child = spawn(python, args, {
+		const child = spawn(python, [cleaner, ...args], {
 			stdio: ["pipe", "pipe", "pipe"],
 			env: process.env,
 		});
-
 		let stdout = "";
 		let stderr = "";
 		let settled = false;
-		const maxOutput = 1024 * 1024;
-		const timer = setTimeout(() => {
+
+		const fail = (error: Error) => {
 			if (settled) return;
 			settled = true;
+			clearTimeout(timer);
 			child.kill("SIGKILL");
-			rejectPromise(new Error(`sidecar timed out after ${timeoutMs}ms`));
-		}, timeoutMs);
+			rejectPromise(error);
+		};
+
+		const timer = setTimeout(
+			() => fail(new Error(`cleaner timed out after ${timeoutMs}ms`)),
+			timeoutMs,
+		);
 
 		child.stdout.on("data", (chunk: Buffer) => {
 			stdout += chunk.toString("utf8");
-			if (stdout.length > maxOutput && !settled) {
-				settled = true;
-				child.kill("SIGKILL");
-				rejectPromise(new Error("sidecar output exceeded 1 MiB"));
-			}
+			if (stdout.length > 1024 * 1024)
+				fail(new Error("cleaner output exceeded 1 MiB"));
 		});
 		child.stderr.on("data", (chunk: Buffer) => {
 			stderr += chunk.toString("utf8");
 		});
-		child.stdin.on("error", (error) => {
-			if (settled) return;
-			settled = true;
-			clearTimeout(timer);
-			child.kill("SIGKILL");
-			rejectPromise(error);
-		});
-		child.on("error", (error) => {
-			if (settled) return;
-			settled = true;
-			clearTimeout(timer);
-			rejectPromise(error);
-		});
+		child.on("error", fail);
+		child.stdin.on("error", fail);
 		child.on("close", (code) => {
 			if (settled) return;
 			settled = true;
 			clearTimeout(timer);
 			if (code !== 0) {
-				rejectPromise(new Error(`sidecar exited ${code}: ${stderr.trim()}`));
+				rejectPromise(new Error(stderr.trim() || `cleaner exited ${code}`));
 				return;
 			}
 			try {
-				resolvePromise(JSON.parse(stdout) as SidecarResult);
+				resolvePromise(JSON.parse(stdout) as CleanerPayload);
 			} catch (error) {
-				rejectPromise(
-					new Error(
-						`invalid sidecar JSON: ${error instanceof Error ? error.message : String(error)}`,
-					),
-				);
-			}
-		});
-
-		try {
-			child.stdin.end(text, "utf8");
-		} catch (error) {
-			if (!settled) {
-				settled = true;
-				clearTimeout(timer);
-				child.kill("SIGKILL");
 				rejectPromise(
 					error instanceof Error ? error : new Error(String(error)),
 				);
 			}
-		}
+		});
+		child.stdin.end(stdin, "utf8");
 	});
 }
 
-export default function promptHelperExtension(pi: ExtensionAPI) {
+export default function promptHelper(pi: ExtensionAPI) {
 	let enabled = envFlag("PI_PROMPT_HELPER_ENABLED", true);
-	const stats: Stats = {
-		seen: 0,
-		compressed: 0,
-		skipped: 0,
-		errors: 0,
-		charsSaved: 0,
+	let state: State = { kind: "idle" };
+	let loading: Promise<void> | undefined;
+	const stats = { seen: 0, cleaned: 0, skipped: 0, errors: 0, charsSaved: 0 };
+
+	const beginLoading = () => {
+		if (loading || state.kind === "ready") return;
+		state = { kind: "loading", startedAt: new Date().toISOString() };
+		loading = runCleaner(["--health"], "")
+			.then((payload) => {
+				if (payload.ok !== true)
+					throw new Error(payload.reason || "health check failed");
+				state = {
+					kind: "ready",
+					mode: payload.mode || "regex",
+					checkedAt: new Date().toISOString(),
+				};
+			})
+			.catch((error) => {
+				state = {
+					kind: "failed",
+					reason: error instanceof Error ? error.message : String(error),
+					checkedAt: new Date().toISOString(),
+				};
+			})
+			.finally(() => {
+				loading = undefined;
+			});
 	};
 
 	pi.registerCommand("exact", {
 		description:
-			"Send a prompt exactly as written, bypassing prompt compression",
-		handler: async (args, ctx) => {
-			const prompt = args.trim();
-			if (!prompt) {
+			"Send a prompt exactly as written, bypassing local prompt cleanup",
+		handler(args, ctx) {
+			const text = args.trim();
+			if (!text) {
 				notify(ctx, "Usage: /exact <prompt>", "warning");
 				return;
 			}
-			pi.sendUserMessage(prompt);
+			pi.sendUserMessage(text);
 		},
 	});
 
-	pi.registerCommand("prompt-helper-toggle", {
-		description: "Toggle local prompt compression for this pi process",
-		handler: async (_args, ctx) => {
+	pi.registerCommand("prompt-cleaner-toggle", {
+		description: "Toggle local prompt cleanup for this process",
+		handler(_args, ctx) {
 			enabled = !enabled;
+			if (enabled) beginLoading();
+			notify(ctx, `prompt cleaner ${enabled ? "enabled" : "disabled"}`);
+		},
+	});
+
+	pi.registerCommand("prompt-cleaner-status", {
+		description: "Show local prompt cleaner readiness",
+		handler(_args, ctx) {
+			if (enabled) beginLoading();
+			const renderedState =
+				state.kind === "ready"
+					? `ready (${state.mode})`
+					: state.kind === "failed"
+						? `failed (${state.reason})`
+						: state.kind;
 			notify(
 				ctx,
-				`pi-prompt-helper ${enabled ? "enabled" : "disabled"}`,
-				"info",
+				`prompt cleaner ${enabled ? "enabled" : "disabled"}; state=${renderedState}`,
 			);
 		},
 	});
 
-	pi.registerCommand("prompt-helper-status", {
-		description: "Show pi-prompt-helper configuration and last sidecar result",
-		handler: async (_args, ctx) => {
-			const minSavings = envNumber("PI_PROMPT_HELPER_MIN_SAVINGS", 0.03);
-			const timeoutMs = envNumber("PI_PROMPT_HELPER_TIMEOUT_MS", 2000);
-			const mode = process.env.PI_PROMPT_HELPER_MODE || "auto";
-			const last = stats.last
-				? `\nLast: ${stats.last.status} (${stats.last.reason || "ok"}, saved ${stats.last.original_chars && stats.last.compressed_chars ? stats.last.original_chars - stats.last.compressed_chars : 0} chars)`
-				: "\nLast: none";
+	pi.registerCommand("prompt-cleaner-stats", {
+		description: "Show prompt cleanup counters",
+		handler(_args, ctx) {
 			notify(
 				ctx,
-				`pi-prompt-helper ${enabled ? "enabled" : "disabled"}\nMode: ${mode}\nMin savings: ${minSavings}\nTimeout: ${timeoutMs}ms\nSidecar: ${process.env.PI_PROMPT_HELPER_SIDECAR || DEFAULT_SIDECAR}${last}`,
-				"info",
+				`seen=${stats.seen} cleaned=${stats.cleaned} skipped=${stats.skipped} errors=${stats.errors} charsSaved=${stats.charsSaved}`,
 			);
 		},
 	});
 
-	pi.registerCommand("prompt-helper-stats", {
-		description: "Show prompt compression counters for this pi process",
-		handler: async (_args, ctx) => {
-			notify(
-				ctx,
-				`pi-prompt-helper stats: seen=${stats.seen}, compressed=${stats.compressed}, skipped=${stats.skipped}, errors=${stats.errors}, charsSaved=${stats.charsSaved}`,
-				"info",
-			);
-		},
-	});
-
-	pi.on("input", async (event, _ctx) => {
+	pi.on("input", async (event) => {
 		stats.seen += 1;
-		const skipReason = shouldSkipInput(event, enabled);
-		if (skipReason) {
+		if (shouldSkip(event, enabled)) {
+			stats.skipped += 1;
+			return { action: "continue" };
+		}
+
+		if (state.kind !== "ready") {
+			beginLoading();
 			stats.skipped += 1;
 			return { action: "continue" };
 		}
 
 		try {
-			const minSavings = envNumber("PI_PROMPT_HELPER_MIN_SAVINGS", 0.03);
-			const timeoutMs = envNumber("PI_PROMPT_HELPER_TIMEOUT_MS", 2000);
-			const mode = process.env.PI_PROMPT_HELPER_MODE || "auto";
-			const result = await runSidecar(event.text, minSavings, mode, timeoutMs);
-			stats.last = { ...result, at: new Date().toISOString() };
-
+			const { minSavings } = settings();
+			const payload = await runCleaner(
+				["--min-savings", String(minSavings)],
+				event.text,
+			);
 			if (
-				result.status === "compressed" &&
-				typeof result.text === "string" &&
-				result.text &&
-				result.text !== event.text
+				payload.status === "cleaned" &&
+				typeof payload.text === "string" &&
+				payload.text !== event.text
 			) {
-				stats.compressed += 1;
-				stats.charsSaved += Math.max(0, event.text.length - result.text.length);
-				return { action: "transform", text: result.text, images: event.images };
+				stats.cleaned += 1;
+				stats.charsSaved += Math.max(
+					0,
+					event.text.length - payload.text.length,
+				);
+				return {
+					action: "transform",
+					text: payload.text,
+					images: event.images,
+				};
 			}
 			stats.skipped += 1;
 			return { action: "continue" };
 		} catch (error) {
 			stats.errors += 1;
-			stats.last = {
-				status: "error",
-				text: event.text,
+			state = {
+				kind: "failed",
 				reason: error instanceof Error ? error.message : String(error),
-				at: new Date().toISOString(),
+				checkedAt: new Date().toISOString(),
 			};
 			return { action: "continue" };
 		}

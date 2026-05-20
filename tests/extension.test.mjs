@@ -4,73 +4,120 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 
-import promptHelperExtension from "../.tmp-test/src/index.js";
+import promptHelper from "../.tmp-test/src/index.js";
 
-function withEnv(patch, fn) {
-	const old = new Map(Object.keys(patch).map((key) => [key, process.env[key]]));
+async function withEnv(patch, fn) {
+	const previous = new Map(
+		Object.keys(patch).map((key) => [key, process.env[key]]),
+	);
 	for (const [key, value] of Object.entries(patch)) {
 		if (value === undefined) delete process.env[key];
 		else process.env[key] = String(value);
 	}
-	return Promise.resolve()
-		.then(fn)
-		.finally(() => {
-			for (const [key, value] of old) {
-				if (value === undefined) delete process.env[key];
-				else process.env[key] = value;
-			}
-		});
+	try {
+		return await fn();
+	} finally {
+		for (const [key, value] of previous) {
+			if (value === undefined) delete process.env[key];
+			else process.env[key] = value;
+		}
+	}
 }
 
-function makePi() {
+function harness() {
 	const commands = new Map();
 	const handlers = new Map();
-	const sentUserMessages = [];
+	const sent = [];
 	return {
 		commands,
 		handlers,
-		sentUserMessages,
+		sent,
 		pi: {
-			registerCommand(name, config) {
-				commands.set(name, config);
+			on(name, handler) {
+				handlers.set(name, handler);
 			},
-			on(event, handler) {
-				handlers.set(event, handler);
+			registerCommand(name, command) {
+				commands.set(name, command);
 			},
-			sendUserMessage(content, options) {
-				sentUserMessages.push({ content, options });
+			sendUserMessage(text) {
+				sent.push(text);
 			},
 		},
 	};
 }
 
-test("extension transforms only compressed sidecar results", async () => {
-	const dir = await mkdtemp(join(tmpdir(), "pi-prompt-helper-test-"));
-	const sidecar = join(dir, "sidecar.mjs");
-	await writeFile(
-		sidecar,
-		"#!/usr/bin/env node\nprocess.stdin.resume();process.stdin.on('end',()=>{console.log(JSON.stringify({status:'compressed',text:'compressed prompt'}));});\n",
-		{ mode: 0o755 },
-	);
+async function wait(ms) {
+	await new Promise((resolve) => setTimeout(resolve, ms));
+}
 
+async function waitForResult(fn, predicate, timeoutMs = 1000) {
+	const deadline = Date.now() + timeoutMs;
+	let result;
+	while (Date.now() < deadline) {
+		result = await fn();
+		if (predicate(result)) return result;
+		await wait(10);
+	}
+	return result;
+}
+
+test("first eligible input starts lazy loading and continues", async () => {
+	const dir = await mkdtemp(join(tmpdir(), "prompt-helper-"));
+	const cleaner = join(dir, "cleaner.mjs");
+	await writeFile(
+		cleaner,
+		`setTimeout(() => console.log(JSON.stringify({ok:true,mode:'regex'})), 60);`,
+	);
 	try {
 		await withEnv(
 			{
 				PI_PROMPT_HELPER_PYTHON: process.execPath,
-				PI_PROMPT_HELPER_SIDECAR: sidecar,
-				PI_PROMPT_HELPER_MIN_SAVINGS: "0",
+				PI_PROMPT_HELPER_CLEANER: cleaner,
 			},
 			async () => {
-				const harness = makePi();
-				promptHelperExtension(harness.pi);
-				const result = await harness.handlers.get("input")(
-					{ text: "original prompt", source: "interactive" },
-					{},
+				const app = harness();
+				promptHelper(app.pi);
+				const result = await app.handlers.get("input")({
+					text: "Please help",
+					source: "user",
+				});
+				assert.deepEqual(result, { action: "continue" });
+			},
+		);
+	} finally {
+		await rm(dir, { recursive: true, force: true });
+	}
+});
+
+test("ready cleaner can transform later input", async () => {
+	const dir = await mkdtemp(join(tmpdir(), "prompt-helper-"));
+	const cleaner = join(dir, "cleaner.mjs");
+	await writeFile(
+		cleaner,
+		`if (process.argv.includes('--health')) console.log(JSON.stringify({ok:true,mode:'regex'}));
+else { process.stdin.resume(); process.stdin.on('end', () => console.log(JSON.stringify({status:'cleaned',text:'clean text'}))); }`,
+	);
+	try {
+		await withEnv(
+			{
+				PI_PROMPT_HELPER_PYTHON: process.execPath,
+				PI_PROMPT_HELPER_CLEANER: cleaner,
+			},
+			async () => {
+				const app = harness();
+				promptHelper(app.pi);
+				const input = app.handlers.get("input");
+				assert.deepEqual(await input({ text: "first", source: "user" }), {
+					action: "continue",
+				});
+				const result = await waitForResult(
+					() => input({ text: "second", source: "user", images: [] }),
+					(value) => value.action === "transform",
 				);
 				assert.deepEqual(result, {
 					action: "transform",
-					text: "compressed prompt",
-					images: undefined,
+					text: "clean text",
+					images: [],
 				});
 			},
 		);
@@ -79,71 +126,47 @@ test("extension transforms only compressed sidecar results", async () => {
 	}
 });
 
-test("extension skips slash commands by default", async () => {
-	const harness = makePi();
-	promptHelperExtension(harness.pi);
-	const result = await harness.handlers.get("input")(
-		{ text: "/model", source: "interactive" },
-		{},
+test("cleaner failure fails open", async () => {
+	const dir = await mkdtemp(join(tmpdir(), "prompt-helper-"));
+	const cleaner = join(dir, "cleaner.mjs");
+	await writeFile(
+		cleaner,
+		`if (process.argv.includes('--health')) console.log(JSON.stringify({ok:true,mode:'regex'})); else process.exit(2);`,
 	);
-	assert.deepEqual(result, { action: "continue" });
-});
-
-test("/exact sends an extension-originated bypass prompt", async () => {
-	const harness = makePi();
-	promptHelperExtension(harness.pi);
-	await harness.commands.get("exact").handler("  Please keep this exact.  ", {
-		hasUI: false,
-		ui: { notify() {} },
-	});
-	assert.deepEqual(harness.sentUserMessages, [
-		{ content: "Please keep this exact.", options: undefined },
-	]);
-});
-
-test("/exact without prompt reports usage and does not send", async () => {
-	const harness = makePi();
-	const notifications = [];
-	promptHelperExtension(harness.pi);
-	await harness.commands.get("exact").handler("   ", {
-		hasUI: true,
-		ui: {
-			notify(message, level) {
-				notifications.push({ message, level });
-			},
-		},
-	});
-	assert.deepEqual(harness.sentUserMessages, []);
-	assert.deepEqual(notifications, [
-		{ message: "Usage: /exact <prompt>", level: "warning" },
-	]);
-});
-
-test("extension fails open on sidecar stdin errors", async () => {
-	const dir = await mkdtemp(join(tmpdir(), "pi-prompt-helper-test-"));
-	const sidecar = join(dir, "exit.mjs");
-	await writeFile(sidecar, "#!/usr/bin/env node\nprocess.exit(0);\n", {
-		mode: 0o755,
-	});
-
 	try {
 		await withEnv(
 			{
 				PI_PROMPT_HELPER_PYTHON: process.execPath,
-				PI_PROMPT_HELPER_SIDECAR: sidecar,
-				PI_PROMPT_HELPER_TIMEOUT_MS: "1000",
+				PI_PROMPT_HELPER_CLEANER: cleaner,
 			},
 			async () => {
-				const harness = makePi();
-				promptHelperExtension(harness.pi);
-				const result = await harness.handlers.get("input")(
-					{ text: "x".repeat(2_000_000), source: "interactive" },
-					{},
-				);
-				assert.deepEqual(result, { action: "continue" });
+				const app = harness();
+				promptHelper(app.pi);
+				const input = app.handlers.get("input");
+				await input({ text: "first", source: "user" });
+				await wait(25);
+				assert.deepEqual(await input({ text: "second", source: "user" }), {
+					action: "continue",
+				});
 			},
 		);
 	} finally {
 		await rm(dir, { recursive: true, force: true });
 	}
+});
+
+test("slash commands are skipped by default", async () => {
+	const app = harness();
+	promptHelper(app.pi);
+	assert.deepEqual(
+		await app.handlers.get("input")({ text: "/help", source: "user" }),
+		{ action: "continue" },
+	);
+});
+
+test("exact command sends raw prompt", async () => {
+	const app = harness();
+	promptHelper(app.pi);
+	await app.commands.get("exact").handler("  keep this exact  ", {});
+	assert.deepEqual(app.sent, ["keep this exact"]);
 });

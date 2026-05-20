@@ -1,7 +1,6 @@
 node_modules/
 .tmp-test/
-.pi-lens/
 __pycache__/
 *.py[cod]
+.pytest_cache/
 .DS_Store
-.env
